@@ -12,7 +12,7 @@ import SelectionBox from './SelectionBox';
 import SelectionCheckboxAll from './SelectionCheckboxAll';
 import Column from './Column';
 import ColumnGroup from './ColumnGroup';
-import createBodyRow from './createBodyRow';
+import createBodyRow, { BodyRowClass } from './createBodyRow';
 import { flatArray, treeMap, flatFilter, normalizeColumns } from './util';
 import {
   TableProps,
@@ -33,6 +33,8 @@ import {
   PaginationConfig,
   PrepareParamsArgumentsReturn,
   ExpandIconProps,
+  WithStore,
+  CheckboxPropsCache,
 } from './interface';
 import Pagination from '../pagination';
 import Icon from '../icon';
@@ -87,7 +89,65 @@ const defaultPagination = {
  */
 const emptyObject = {};
 
-export default class Table<T> extends React.Component<TableProps<T>, TableState<T>> {
+let tableRow: BodyRowClass | undefined;
+
+const createComponents = (
+  components: TableComponents = {},
+  prevComponents?: TableComponents,
+  isCalledFromConstructor?: boolean,
+) => {
+  const bodyRow = components && components.body && components.body.row;
+  const prevBodyRow = prevComponents && prevComponents.body && prevComponents.body.row;
+  if (isCalledFromConstructor) {
+    // 'tableRow' needs to act like a class property
+    tableRow = undefined;
+  }
+  if (!tableRow || bodyRow !== prevBodyRow) {
+    tableRow = createBodyRow(bodyRow);
+  }
+  return {
+    ...components,
+    body: {
+      ...components.body,
+      row: tableRow,
+    },
+  };
+};
+
+function getFilteredValueColumns<T>(state: TableState<T>, columns?: ColumnProps<T>[]) {
+  return flatFilter(
+    columns || (state || {}).columns || [],
+    (column: ColumnProps<T>) => typeof column.filteredValue !== 'undefined',
+  );
+}
+
+function getFiltersFromColumns<T>(
+  state: TableState<T> = {} as TableState<T>,
+  columns?: ColumnProps<T>[],
+) {
+  const filters: any = {};
+  getFilteredValueColumns<T>(state, columns).forEach((col: ColumnProps<T>) => {
+    const colKey = getColumnKey(col) as string;
+    filters[colKey] = col.filteredValue;
+  });
+  return filters;
+}
+
+function isFiltersChanged<T>(state: TableState<T>, filters: TableStateFilters): boolean {
+  let filtersChanged = false;
+  if (Object.keys(filters).length !== Object.keys(state.filters).length) {
+    filtersChanged = true;
+  } else {
+    Object.keys(filters).forEach(columnKey => {
+      if (filters[columnKey] !== state.filters[columnKey]) {
+        filtersChanged = true;
+      }
+    });
+  }
+  return filtersChanged;
+}
+
+class Table<T> extends React.Component<TableProps<T>, TableState<T>> {
   static Column = Column;
 
   static ColumnGroup = ColumnGroup;
@@ -124,22 +184,83 @@ export default class Table<T> extends React.Component<TableProps<T>, TableState<
     childrenColumnName: 'children',
   };
 
-  CheckboxPropsCache: {
-    [key: string]: any;
-  };
+  static getDerivedStateFromProps(nextProps: TableProps<any>, prevState: TableState<any>) {
+    const { prevProps } = prevState;
+    const columns =
+      nextProps.columns || normalizeColumns(nextProps.children as React.ReactChildren);
 
-  store: Store;
+    let nextState: TableState<any> = {
+      ...prevState,
+      prevProps: nextProps,
+      columns,
+    };
 
-  columns: ColumnProps<T>[];
+    if ('pagination' in nextProps || 'pagination' in prevProps) {
+      const newPagination = {
+        ...defaultPagination,
+        ...prevState.pagination,
+        ...nextProps.pagination,
+      };
+      newPagination.current = newPagination.current || 1;
+      newPagination.pageSize = newPagination.pageSize || 10;
 
-  components: TableComponents;
+      nextState = {
+        ...nextState,
+        pagination: nextProps.pagination !== false ? newPagination : emptyObject,
+      };
+    }
+
+    if (nextProps.rowSelection && 'selectedRowKeys' in nextProps.rowSelection) {
+      nextProps.store.setState({
+        selectedRowKeys: nextProps.rowSelection.selectedRowKeys || [],
+      });
+    } else if (prevProps.rowSelection && !nextProps.rowSelection) {
+      nextProps.store.setState({
+        selectedRowKeys: [],
+      });
+    }
+    if ('dataSource' in nextProps && nextProps.dataSource !== prevProps.dataSource) {
+      nextProps.store.setState({
+        selectionDirty: false,
+      });
+    }
+    // https://github.com/ant-design/ant-design/issues/10133
+    nextProps.setCheckboxPropsCache({});
+
+    // Update filters
+    const filteredValueColumns = getFilteredValueColumns(nextState, nextState.columns);
+    if (filteredValueColumns.length > 0) {
+      const filtersFromColumns = getFiltersFromColumns(nextState, nextState.columns);
+      const newFilters = { ...nextState.filters };
+      Object.keys(filtersFromColumns).forEach(key => {
+        newFilters[key] = filtersFromColumns[key];
+      });
+      if (isFiltersChanged(nextState, newFilters)) {
+        nextState = {
+          ...nextState,
+          filters: newFilters,
+        };
+      }
+    }
+
+    if (nextProps.components !== prevProps.components) {
+      const components = createComponents(nextProps.components, prevProps.components);
+
+      nextState = {
+        ...nextState,
+        components,
+      };
+    }
+
+    return nextState;
+  }
 
   row: React.ComponentType<any>;
 
   constructor(props: TableProps<T>) {
     super(props);
 
-    const { expandedRowRender, columns = [] } = props;
+    const { expandedRowRender, columns: columnsProp = [] } = props;
 
     warning(
       !('columnsPageRange' in props || 'columnsPageSize' in props),
@@ -148,7 +269,7 @@ export default class Table<T> extends React.Component<TableProps<T>, TableState<
         'fixed columns instead, see: https://u.ant.design/fixed-columns.',
     );
 
-    if (expandedRowRender && columns.some(({ fixed }) => !!fixed)) {
+    if (expandedRowRender && columnsProp.some(({ fixed }) => !!fixed)) {
       warning(
         false,
         'Table',
@@ -156,60 +277,23 @@ export default class Table<T> extends React.Component<TableProps<T>, TableState<
       );
     }
 
-    this.columns = props.columns || normalizeColumns(props.children as React.ReactChildren);
-
-    this.createComponents(props.components);
+    const columns = columnsProp || normalizeColumns(props.children as React.ReactChildren);
 
     this.state = {
-      ...this.getDefaultSortOrder(this.columns),
+      ...this.getDefaultSortOrder(columns),
       // 减少状态
-      filters: this.getFiltersFromColumns(),
+      filters: getFiltersFromColumns<T>(),
       pagination: this.getDefaultPagination(props),
       pivot: undefined,
+      prevProps: props,
+      components: createComponents(props.components, undefined, true),
+      columns,
     };
-
-    this.CheckboxPropsCache = {};
-
-    this.store = createStore({
-      selectedRowKeys: getRowSelection(props).selectedRowKeys || [],
-      selectionDirty: false,
-    });
   }
 
-  componentWillReceiveProps(nextProps: TableProps<T>) {
-    this.columns = nextProps.columns || normalizeColumns(nextProps.children as React.ReactChildren);
-    if ('pagination' in nextProps || 'pagination' in this.props) {
-      this.setState(previousState => {
-        const newPagination = {
-          ...defaultPagination,
-          ...previousState.pagination,
-          ...nextProps.pagination,
-        };
-        newPagination.current = newPagination.current || 1;
-        newPagination.pageSize = newPagination.pageSize || 10;
-        return { pagination: nextProps.pagination !== false ? newPagination : emptyObject };
-      });
-    }
-    if (nextProps.rowSelection && 'selectedRowKeys' in nextProps.rowSelection) {
-      this.store.setState({
-        selectedRowKeys: nextProps.rowSelection.selectedRowKeys || [],
-      });
-    } else if (this.props.rowSelection && !nextProps.rowSelection) {
-      this.store.setState({
-        selectedRowKeys: [],
-      });
-    }
-    if ('dataSource' in nextProps && nextProps.dataSource !== this.props.dataSource) {
-      this.store.setState({
-        selectionDirty: false,
-      });
-    }
-
-    // https://github.com/ant-design/ant-design/issues/10133
-    this.CheckboxPropsCache = {};
-
-    if (this.getSortOrderColumns(this.columns).length > 0) {
-      const sortState = this.getSortStateFromColumns(this.columns);
+  componentDidUpdate() {
+    if (this.getSortOrderColumns(this.state.columns).length > 0) {
+      const sortState = this.getSortStateFromColumns(this.state.columns);
       if (
         sortState.sortColumn !== this.state.sortColumn ||
         sortState.sortOrder !== this.state.sortOrder
@@ -217,20 +301,6 @@ export default class Table<T> extends React.Component<TableProps<T>, TableState<
         this.setState(sortState);
       }
     }
-
-    const filteredValueColumns = this.getFilteredValueColumns(this.columns);
-    if (filteredValueColumns.length > 0) {
-      const filtersFromColumns = this.getFiltersFromColumns(this.columns);
-      const newFilters = { ...this.state.filters };
-      Object.keys(filtersFromColumns).forEach(key => {
-        newFilters[key] = filtersFromColumns[key];
-      });
-      if (this.isFiltersChanged(newFilters)) {
-        this.setState({ filters: newFilters });
-      }
-    }
-
-    this.createComponents(nextProps.components, this.props.components);
   }
 
   getCheckboxPropsByItem = (item: T, index: number) => {
@@ -240,16 +310,16 @@ export default class Table<T> extends React.Component<TableProps<T>, TableState<
     }
     const key = this.getRecordKey(item, index);
     // Cache checkboxProps
-    if (!this.CheckboxPropsCache[key]) {
-      this.CheckboxPropsCache[key] = rowSelection.getCheckboxProps(item) || {};
-      const checkboxProps = this.CheckboxPropsCache[key];
+    if (!this.props.checkboxPropsCache[key]) {
+      this.props.checkboxPropsCache[key] = rowSelection.getCheckboxProps(item) || {};
+      const checkboxProps = this.props.checkboxPropsCache[key];
       warning(
         !('checked' in checkboxProps) && !('defaultChecked' in checkboxProps),
         'Table',
         'Do not set `checked` or `defaultChecked` in `getCheckboxProps`. Please use `selectedRowKeys` instead.',
       );
     }
-    return this.CheckboxPropsCache[key];
+    return this.props.checkboxPropsCache[key];
   };
 
   getDefaultSelection() {
@@ -289,25 +359,9 @@ export default class Table<T> extends React.Component<TableProps<T>, TableState<
 
   getSortOrderColumns(columns?: ColumnProps<T>[]) {
     return flatFilter(
-      columns || this.columns || [],
+      columns || (this.state || {}).columns || [],
       (column: ColumnProps<T>) => 'sortOrder' in column,
     );
-  }
-
-  getFilteredValueColumns(columns?: ColumnProps<T>[]) {
-    return flatFilter(
-      columns || this.columns || [],
-      (column: ColumnProps<T>) => typeof column.filteredValue !== 'undefined',
-    );
-  }
-
-  getFiltersFromColumns(columns?: ColumnProps<T>[]) {
-    const filters: any = {};
-    this.getFilteredValueColumns(columns).forEach((col: ColumnProps<T>) => {
-      const colKey = getColumnKey(col) as string;
-      filters[colKey] = col.filteredValue;
-    });
-    return filters;
   }
 
   getDefaultSortOrder(columns?: ColumnProps<T>[]) {
@@ -458,7 +512,7 @@ export default class Table<T> extends React.Component<TableProps<T>, TableState<
     return {
       ...custom,
       prefixCls,
-      store: this.store,
+      store: this.props.store,
       rowKey: this.getRecordKey(record, index),
     };
   };
@@ -467,7 +521,7 @@ export default class Table<T> extends React.Component<TableProps<T>, TableState<
     const { selectWay, record, checked, changeRowKeys, nativeEvent } = selectionInfo;
     const rowSelection = getRowSelection(this.props);
     if (rowSelection && !('selectedRowKeys' in rowSelection)) {
-      this.store.setState({ selectedRowKeys });
+      this.props.store.setState({ selectedRowKeys });
     }
     const data = this.getFlatData();
     if (!rowSelection.onChange && !rowSelection[selectWay]) {
@@ -514,7 +568,7 @@ export default class Table<T> extends React.Component<TableProps<T>, TableState<
     };
     // Remove filters not in current columns
     const currentColumnKeys: string[] = [];
-    treeMap(this.columns, c => {
+    treeMap(this.state.columns, c => {
       if (!c.children) {
         currentColumnKeys.push(getColumnKey(c) as string);
       }
@@ -537,7 +591,7 @@ export default class Table<T> extends React.Component<TableProps<T>, TableState<
     };
     const filtersToSetState = { ...filters };
     // Remove filters which is controlled
-    this.getFilteredValueColumns().forEach((col: ColumnProps<T>) => {
+    getFilteredValueColumns<T>(this.state).forEach((col: ColumnProps<T>) => {
       const columnKey = getColumnKey(col);
       if (columnKey) {
         delete filtersToSetState[columnKey];
@@ -556,7 +610,7 @@ export default class Table<T> extends React.Component<TableProps<T>, TableState<
     }
 
     this.setState(newState, () => {
-      this.store.setState({
+      this.props.store.setState({
         selectionDirty: false,
       });
       const { onChange } = this.props;
@@ -577,8 +631,10 @@ export default class Table<T> extends React.Component<TableProps<T>, TableState<
   handleSelect = (record: T, rowIndex: number, e: CheckboxChangeEvent) => {
     const checked = e.target.checked;
     const nativeEvent = e.nativeEvent;
-    const defaultSelection = this.store.getState().selectionDirty ? [] : this.getDefaultSelection();
-    let selectedRowKeys = this.store.getState().selectedRowKeys.concat(defaultSelection);
+    const defaultSelection = this.props.store.getState().selectionDirty
+      ? []
+      : this.getDefaultSelection();
+    let selectedRowKeys = this.props.store.getState().selectedRowKeys.concat(defaultSelection);
     const key = this.getRecordKey(record, rowIndex);
     const { pivot } = this.state;
     const rows = this.getFlatCurrentPageData();
@@ -612,7 +668,7 @@ export default class Table<T> extends React.Component<TableProps<T>, TableState<
       }
 
       this.setState({ pivot: realIndex });
-      this.store.setState({
+      this.props.store.setState({
         selectionDirty: true,
       });
       this.setSelectedRowKeys(selectedRowKeys, {
@@ -630,7 +686,7 @@ export default class Table<T> extends React.Component<TableProps<T>, TableState<
       }
 
       this.setState({ pivot: realIndex });
-      this.store.setState({
+      this.props.store.setState({
         selectionDirty: true,
       });
       this.setSelectedRowKeys(selectedRowKeys, {
@@ -648,7 +704,7 @@ export default class Table<T> extends React.Component<TableProps<T>, TableState<
     const nativeEvent = e.nativeEvent;
     const key = this.getRecordKey(record, rowIndex);
     const selectedRowKeys = [key];
-    this.store.setState({
+    this.props.store.setState({
       selectionDirty: true,
     });
     this.setSelectedRowKeys(selectedRowKeys, {
@@ -662,8 +718,10 @@ export default class Table<T> extends React.Component<TableProps<T>, TableState<
 
   handleSelectRow = (selectionKey: string, index: number, onSelectFunc: SelectionItemSelectFn) => {
     const data = this.getFlatCurrentPageData();
-    const defaultSelection = this.store.getState().selectionDirty ? [] : this.getDefaultSelection();
-    const selectedRowKeys = this.store.getState().selectedRowKeys.concat(defaultSelection);
+    const defaultSelection = this.props.store.getState().selectionDirty
+      ? []
+      : this.getDefaultSelection();
+    const selectedRowKeys = this.props.store.getState().selectedRowKeys.concat(defaultSelection);
     const changeableRowKeys = data
       .filter((item, i) => !this.getCheckboxPropsByItem(item, i).disabled)
       .map((item, i) => this.getRecordKey(item, i));
@@ -708,7 +766,7 @@ export default class Table<T> extends React.Component<TableProps<T>, TableState<
         break;
     }
 
-    this.store.setState({
+    this.props.store.setState({
       selectionDirty: true,
     });
     // when select custom selection, callback selections[n].onSelect
@@ -749,7 +807,7 @@ export default class Table<T> extends React.Component<TableProps<T>, TableState<
     }
     this.setState(newState);
 
-    this.store.setState({
+    this.props.store.setState({
       selectionDirty: false,
     });
 
@@ -842,20 +900,6 @@ export default class Table<T> extends React.Component<TableProps<T>, TableState<
     return (props || this.props).pagination !== false;
   }
 
-  isFiltersChanged(filters: TableStateFilters) {
-    let filtersChanged = false;
-    if (Object.keys(filters).length !== Object.keys(this.state.filters).length) {
-      filtersChanged = true;
-    } else {
-      Object.keys(filters).forEach(columnKey => {
-        if (filters[columnKey] !== this.state.filters[columnKey]) {
-          filtersChanged = true;
-        }
-      });
-    }
-    return filtersChanged;
-  }
-
   isSortColumn(column: ColumnProps<T>) {
     const { sortColumn } = this.state;
     if (!column || !sortColumn) {
@@ -888,27 +932,12 @@ export default class Table<T> extends React.Component<TableProps<T>, TableState<
 
   findColumn(myKey: string | number) {
     let column;
-    treeMap(this.columns, c => {
+    treeMap(this.state.columns, c => {
       if (getColumnKey(c) === myKey) {
         column = c;
       }
     });
     return column;
-  }
-
-  createComponents(components: TableComponents = {}, prevComponents?: TableComponents) {
-    const bodyRow = components && components.body && components.body.row;
-    const preBodyRow = prevComponents && prevComponents.body && prevComponents.body.row;
-    if (!this.row || bodyRow !== preBodyRow) {
-      this.row = createBodyRow(bodyRow);
-    }
-    this.components = {
-      ...components,
-      body: {
-        ...components.body,
-        row: this.row,
-      },
-    };
   }
 
   recursiveSort(data: T[], sorterFn: (a: any, b: any) => number): T[] {
@@ -998,7 +1027,7 @@ export default class Table<T> extends React.Component<TableProps<T>, TableState<
         <span onClick={stopPropagation}>
           <SelectionBox
             type={type}
-            store={this.store}
+            store={this.props.store}
             rowIndex={rowKey}
             onChange={handleChange}
             defaultSelection={this.getDefaultSelection()}
@@ -1019,7 +1048,7 @@ export default class Table<T> extends React.Component<TableProps<T>, TableState<
     getPopupContainer: TableProps<T>['getPopupContainer'];
   }) {
     const { rowSelection } = this.props;
-    const columns = this.columns.concat();
+    const columns = this.state.columns.concat();
     if (rowSelection) {
       const data = this.getFlatCurrentPageData().filter((item, index) => {
         if (rowSelection.getCheckboxProps) {
@@ -1047,7 +1076,7 @@ export default class Table<T> extends React.Component<TableProps<T>, TableState<
         );
         selectionColumn.title = selectionColumn.title || (
           <SelectionCheckboxAll
-            store={this.store}
+            store={this.props.store}
             locale={locale}
             data={data}
             getCheckboxPropsByItem={this.getCheckboxPropsByItem}
@@ -1263,7 +1292,7 @@ export default class Table<T> extends React.Component<TableProps<T>, TableState<
         expandIcon={this.renderExpandIcon(prefixCls)}
         {...restProps}
         onRow={(record: T, index: number) => this.onRow(prefixCls, record, index)}
-        components={this.components}
+        components={this.state.components}
         prefixCls={prefixCls}
         data={data}
         columns={columns}
@@ -1333,3 +1362,40 @@ export default class Table<T> extends React.Component<TableProps<T>, TableState<
     return <ConfigConsumer>{this.renderComponent}</ConfigConsumer>;
   }
 }
+
+function withStore(
+  WrappedComponent: typeof Table,
+): React.ComponentClass<Omit<TableProps<any>, keyof WithStore>> {
+  class Component<T> extends React.Component<TableProps<T>> {
+    store: Store;
+
+    CheckboxPropsCache: CheckboxPropsCache;
+
+    constructor(props: TableProps<T>) {
+      super(props);
+
+      this.CheckboxPropsCache = {};
+
+      this.store = createStore({
+        selectedRowKeys: getRowSelection(props).selectedRowKeys || [],
+        selectionDirty: false,
+      });
+    }
+
+    setCheckboxPropsCache = (cache: CheckboxPropsCache) => (this.CheckboxPropsCache = cache);
+
+    render() {
+      return (
+        <WrappedComponent<T>
+          {...this.props}
+          store={this.store}
+          checkboxPropsCache={this.CheckboxPropsCache}
+          setCheckboxPropsCache={this.setCheckboxPropsCache}
+        />
+      );
+    }
+  }
+  return Component;
+}
+
+export default withStore(Table);
